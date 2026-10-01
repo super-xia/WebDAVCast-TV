@@ -10,6 +10,11 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.StringReader
+import java.security.SecureRandom
+import java.security.cert.X509Certificate
+import javax.net.ssl.SSLContext
+import javax.net.ssl.TrustManager
+import javax.net.ssl.X509TrustManager
 
 /** WebDAV 目录条目。 */
 data class DavEntry(
@@ -20,11 +25,35 @@ data class DavEntry(
     val modified: String = "",
 )
 
-/** 列目录结果:entries 或 error 二选一。 */
+/** 列目录结果:entries 或 error 二选一。baseUsed 记录实际成功的协议(自动切换 scheme 后回写)。 */
 data class DavListResult(
     val entries: List<DavEntry> = emptyList(),
     val error: String? = null,
+    val baseUsed: String? = null,
 )
+
+/**
+ * 自签名证书场景(局域网自托管 NAS 常见)下的 OkHttp 构建器。
+ * 信任所有证书且不做主机名校验 —— 仅用于内网自托管 WebDAV, 不要用于公网敏感服务。
+ */
+object UnsafeOkHttp {
+    fun client(): OkHttpClient {
+        val trustAll = object : X509TrustManager {
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+            override fun getAcceptedIssuers(): Array<X509Certificate> = arrayOf()
+        }
+        val ssl = SSLContext.getInstance("TLS").apply {
+            init(null, arrayOf<TrustManager>(trustAll), SecureRandom())
+        }
+        return OkHttpClient.Builder()
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .sslSocketFactory(ssl.socketFactory, trustAll)
+            .hostnameVerifier { _, _ -> true }
+            .build()
+    }
+}
 
 /** 极简 WebDAV 客户端:PROPFIND 列目录 + Basic 认证。 */
 class WebDavClient(
@@ -32,15 +61,45 @@ class WebDavClient(
     private val user: String,
     private val pass: String,
 ) {
-    private val client = OkHttpClient.Builder()
-        .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-        .build()
+    private val client = UnsafeOkHttp.client()
 
     private val auth = Credentials.basic(user, pass)
 
     suspend fun list(path: String): DavListResult = withContext(Dispatchers.IO) {
-        val url = urlOf(path)
+        val primary = urlOf(path)
+        // 自动探测: 若当前 scheme(http/https)失败, 尝试互换后重试。
+        // 解决"缓存/默认 scheme 与实际不符"导致的 400(http 请求打到了 https 端口)。
+        val candidates = buildList {
+            add(primary)
+            val swapped = swapScheme(primary)
+            if (swapped != null) add(swapped)
+        }
+        var lastError: String? = null
+        for (candidate in candidates) {
+            val result = tryList(candidate, path) ?: continue
+            if (result.error == null) {
+                // 自动切换成功: 回传实际生效的协议, 让调用方修正 serverScheme(否则后续播放 URL 仍会是错的)
+                val usedScheme = if (candidate.startsWith("https://")) "https" else "http"
+                return@withContext result.copy(baseUsed = usedScheme)
+            }
+            lastError = result.error
+            // 只有可能是 scheme 问题的错误才继续尝试下一个, 避免无谓重试(401/403/404 等)
+            if (lastError != null && lastError !in setOf(
+                    "服务器错误(HTTP 400)", "连接失败"
+                )) break
+        }
+        DavListResult(error = lastError ?: "连接失败")
+    }
+
+    private fun swapScheme(url: String): String? {
+        return when {
+            url.startsWith("https://") -> "http://" + url.substringAfter("https://")
+            url.startsWith("http://") -> "https://" + url.substringAfter("http://")
+            else -> null
+        }
+    }
+
+    private fun tryList(url: String, path: String): DavListResult? {
         val body = """<?xml version="1.0" encoding="utf-8"?>
 <d:propfind xmlns:d="DAV:">
   <d:prop>
@@ -56,7 +115,7 @@ class WebDavClient(
             .header("Depth", "1")
             .header("Authorization", auth)
             .build()
-        try {
+        return try {
             client.newCall(req).execute().use { resp ->
                 when {
                     !resp.isSuccessful -> DavListResult(error = httpError(resp.code))
@@ -69,7 +128,7 @@ class WebDavClient(
                 }
             }
         } catch (e: Exception) {
-            DavListResult(error = "连接失败: ${e.message ?: e.javaClass.simpleName}")
+            DavListResult(error = "连接失败")
         }
     }
 

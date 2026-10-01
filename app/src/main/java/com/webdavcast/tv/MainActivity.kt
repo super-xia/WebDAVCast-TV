@@ -146,12 +146,14 @@ fun TvApp() {
     var serverPort by rememberSaveable { mutableStateOf(0) }
     var serverName by rememberSaveable { mutableStateOf("") }
     var serverPath by rememberSaveable { mutableStateOf("") }
+    var serverScheme by rememberSaveable { mutableStateOf("http") }
     // 冷启动恢复上次服务器
     remember {
         val ls = Prefs.getLastServer(ctx).split("|")
-        if (serverHost.isBlank() && ls.size >= 4 && ls[1].toIntOrNull() != null) {
+        if (serverHost.isBlank() && ls.size >= 5 && ls[1].toIntOrNull() != null) {
             serverHost = ls[0]; serverPort = ls[1].toInt()
             serverName = ls[2]; serverPath = ls[3]
+            serverScheme = ls[4].ifEmpty { "http" }.lowercase()
         }
     }
     var path by rememberSaveable { mutableStateOf("/") }
@@ -161,8 +163,8 @@ fun TvApp() {
         val p = raw.split("|", limit = 5)
         if (p.size >= 3) DavEntry(p[0], p[1] == "1", p[2], p.getOrElse(3) { "" }.toLongOrNull() ?: 0L, p.getOrElse(4) { "" }) else null
     }
-    val server = remember(serverHost, serverPort, serverName, serverPath) {
-        if (serverHost.isNotBlank() && serverPort > 0) ServerEntry(serverHost, serverPort, serverName, serverPath) else null
+    val server = remember(serverHost, serverPort, serverName, serverPath, serverScheme) {
+        if (serverHost.isNotBlank() && serverPort > 0) ServerEntry(serverHost, serverPort, serverName, serverPath, serverScheme) else null
     }
     // 浏览列表返回时恢复的条目索引
     var browseSavedIndex by rememberSaveable { mutableStateOf(0) }
@@ -172,7 +174,8 @@ fun TvApp() {
 
     fun setServer(s: ServerEntry) {
         serverHost = s.host; serverPort = s.port; serverName = s.name; serverPath = s.basePath
-        Prefs.setLastServer(ctx, s.host, s.port, s.name, s.basePath)
+        serverScheme = s.scheme
+        Prefs.setLastServer(ctx, s.host, s.port, s.name, s.basePath, s.scheme)
     }
 
     when (screen) {
@@ -201,7 +204,7 @@ fun TvApp() {
             onPlayHistory = { h ->
                 val srv = server ?: run {
                     val ls = Prefs.getLastServer(ctx).split("|")
-                    if (ls.size >= 4 && ls[1].toIntOrNull() != null) ServerEntry(ls[0], ls[1].toInt(), ls[2], ls[3]) else null
+                    if (ls.size >= 5 && ls[1].toIntOrNull() != null) ServerEntry(ls[0], ls[1].toInt(), ls[2], ls[3], ls[4].ifEmpty { "http" }.lowercase()) else null
                 }
                 videoUrl = relocateUrl(h.url, srv)
                 videoEntryRaw = "${h.title}|0|${videoUrl}|${h.durationMs}|"
@@ -215,6 +218,7 @@ fun TvApp() {
                 else (ctx as? ComponentActivity)?.finish()
             },
             onSwitchServer = { screen = Screen.Setup },
+            onSchemeResolved = { serverScheme = it },
         )
         Screen.Player -> PlayerScreen(
             server = server, url = videoUrl, entry = videoEntry, currentPath = path,
@@ -226,6 +230,7 @@ fun TvApp() {
                 }
             },
             onSystemBack = { if (fromHistory) { fromHistory = false; path = "/" }; screen = Screen.Browse },
+            onSchemeResolved = { serverScheme = it },
         )
     }
 }
@@ -521,8 +526,13 @@ private fun SetupScreen(
     }
 }
 
-/** 解析手动地址 host:port/path → ServerEntry；不合法返回 null。 */
+/** 解析手动地址 [scheme://]host:port/path → ServerEntry；不合法返回 null。 */
 private fun parseManualServer(input: String): ServerEntry? {
+    val rawScheme = when {
+        input.contains("https://") -> "https"
+        input.contains("http://") -> "http"
+        else -> "http"
+    }
     val t = input.trim().removePrefix("http://").removePrefix("https://").trimEnd('/')
     if (t.isBlank()) return null
     val hostPort = t.substringBefore('/')
@@ -531,7 +541,7 @@ private fun parseManualServer(input: String): ServerEntry? {
     val port = hostPort.substringAfter(':', "").toIntOrNull() ?: 80
     if (host.isBlank()) return null
     val basePath = if (path.isBlank()) "" else "/" + path.trim('/')
-    return ServerEntry(host, port, "", basePath)
+    return ServerEntry(host, port, "", basePath, rawScheme)
 }
 
 // ===== 服务器选择页 =====
@@ -551,7 +561,7 @@ private fun ServerPickScreen(
         servers.forEach { s ->
             val ok = withContext(Dispatchers.IO) {
                 try {
-                    WebDavClient("http://${s.host}:${s.port}${s.basePath}", Prefs.getUser(ctx), Prefs.getPass(ctx))
+                    WebDavClient("${s.scheme}://${s.host}:${s.port}${s.basePath}", Prefs.getUser(ctx), Prefs.getPass(ctx))
                         .list("/").error == null
                 } catch (e: Exception) { false }
             }
@@ -621,6 +631,7 @@ private fun BrowseScreen(
     onPlayHistory: (PlayHistory) -> Unit,
     onBack: () -> Unit,
     onSwitchServer: () -> Unit,
+    onSchemeResolved: (String) -> Unit = {},
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -638,10 +649,12 @@ private fun BrowseScreen(
         val seq = ++reqSeq
         loading = true; entries = null; error = ""
         scope.launch {
-            val client = WebDavClient("http://${s.host}:${s.port}${s.basePath}", Prefs.getUser(ctx), Prefs.getPass(ctx))
+            val client = WebDavClient("${s.scheme}://${s.host}:${s.port}${s.basePath}", Prefs.getUser(ctx), Prefs.getPass(ctx))
             val result = client.list(currentPath)
             if (seq != reqSeq) return@launch
             loading = false
+            // 自动切换协议成功: 把实际生效的 scheme 写回, 保证后续播放 URL / 选集也正确
+            if (result.baseUsed != null && result.baseUsed != s.scheme) onSchemeResolved(result.baseUsed)
             when {
                 result.error != null -> error = result.error
                 result.entries.isEmpty() -> error = "目录是空的"
@@ -769,6 +782,7 @@ private fun PlayerScreen(
     currentPath: String = "",
     onSwitchEpisode: (DavEntry) -> Unit,
     onSystemBack: () -> Unit,
+    onSchemeResolved: (String) -> Unit = {},
 ) {
     val name = entry?.name ?: ""
     val ctx = LocalContext.current
@@ -794,10 +808,7 @@ private fun PlayerScreen(
     val currentIdx = remember(episodes, currentName) { episodes?.indexOfFirst { it.name == currentName } ?: -1 }
 
     val player = remember {
-        val okHttp = okhttp3.OkHttpClient.Builder()
-            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-            .build()
+        val okHttp = UnsafeOkHttp.client()
         val dsFactory = OkHttpDataSource.Factory(okHttp)
             .setUserAgent("WebDAVCast-TV/1.0")
             .setDefaultRequestProperties(mapOf("Authorization" to BasicAuth.header(user, pass)))
@@ -840,9 +851,10 @@ private fun PlayerScreen(
         val s = server ?: return@LaunchedEffect
         if (currentPath.isBlank()) return@LaunchedEffect
         episodesLoading = true; episodes = null
-        val client = WebDavClient("http://${s.host}:${s.port}${s.basePath}", user, pass)
+        val client = WebDavClient("${s.scheme}://${s.host}:${s.port}${s.basePath}", user, pass)
         val result = client.list(currentPath)
         episodesLoading = false
+        if (result.baseUsed != null && result.baseUsed != s.scheme) onSchemeResolved(result.baseUsed)
         if (result.error == null) {
             episodes = result.entries.filter { !it.isDir && fileType(it.name).third }
                 .sortedWith { x, y -> naturalCompare(x.name, y.name) }
@@ -1265,7 +1277,7 @@ private fun urlFor(s: ServerEntry, href: String): String {
         val parts = decoded.split("/")
         parts.joinToString("/") { java.net.URLEncoder.encode(it, "UTF-8").replace("+", "%20") }
     } catch (e: Exception) { p }
-    return "http://${s.host}:${s.port}$encoded"
+    return "${s.scheme}://${s.host}:${s.port}$encoded"
 }
 
 private fun relocateUrl(oldUrl: String, server: ServerEntry?): String {
@@ -1273,7 +1285,7 @@ private fun relocateUrl(oldUrl: String, server: ServerEntry?): String {
     val scheme = if (oldUrl.startsWith("https://")) "https" else "http"
     val afterScheme = oldUrl.substringAfter("://", "")
     val pathPart = afterScheme.substringAfter("/", "")
-    return "$scheme://${server.host}:${server.port}/${pathPart.trimStart('/')}"
+    return "${server.scheme}://${server.host}:${server.port}/${pathPart.trimStart('/')}"
 }
 
 private fun inferDirFromUrl(url: String, server: ServerEntry?): String {
