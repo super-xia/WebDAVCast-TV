@@ -93,9 +93,11 @@ private fun keyOf(url: String): String {
     return after.substringAfter("/", "/")
 }
 
-/** 目录键: 统一为 /path/ 格式(根目录为 /)。 */
+/** 目录键: 统一为 /path/ 格式(根目录为 /)。先 URL 解码,
+ *  避免旧历史里的编码路径(%E7%94%B5%E5%BD%B1)与新的中文路径被当成两个目录。 */
 private fun dirKeyOf(dirPath: String): String {
-    return dirPath.trim().trim('/').let { if (it.isEmpty()) "/" else "/$it/" }
+    val d = try { java.net.URLDecoder.decode(dirPath, "UTF-8") } catch (e: Exception) { dirPath }
+    return d.trim().trim('/').let { if (it.isEmpty()) "/" else "/$it/" }
 }
 
     /** 按 URL 查历史(没有返回 null)。服务器变了也能按路径匹配到同一条。 */

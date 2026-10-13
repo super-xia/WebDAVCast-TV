@@ -1288,6 +1288,11 @@ private fun relocateUrl(oldUrl: String, server: ServerEntry?): String {
     return "${server.scheme}://${server.host}:${server.port}/${pathPart.trimStart('/')}"
 }
 
+/** 路径解码: 服务器 href / 旧历史里存的路径可能是 URL 编码的(%E7%94%B5%E5%BD%B1),
+ *  显示与请求前统一解码, 保证界面显示中文(与手机版 1.0.8 一致)。 */
+private fun decodePathSafe(p: String): String =
+    if (p.isBlank()) p else try { java.net.URLDecoder.decode(p, "UTF-8") } catch (e: Exception) { p }
+
 private fun inferDirFromUrl(url: String, server: ServerEntry?): String {
     if (url.isBlank()) return "/"
     val pathPart = url.substringAfter("://", "").substringAfter("/", "")
@@ -1295,7 +1300,9 @@ private fun inferDirFromUrl(url: String, server: ServerEntry?): String {
     var rel = dir.trim('/')
     val bp = server?.basePath?.trim('/') ?: ""
     if (bp.isNotEmpty() && rel.startsWith(bp)) rel = rel.removePrefix(bp).trimStart('/')
-    return if (rel.isEmpty()) "/" else "/$rel/"
+    // URL 解码: 旧历史里的路径可能是编码过的(%E7%94%B5%E5%BD%B1), 显示/回目录需要中文
+    val dec = decodePathSafe(rel)
+    return if (dec.isEmpty()) "/" else "/$dec/"
 }
 
 private fun relativePath(s: ServerEntry, href: String): String {
@@ -1303,8 +1310,14 @@ private fun relativePath(s: ServerEntry, href: String): String {
     if (p.startsWith("http://") || p.startsWith("https://")) {
         p = p.substringAfter("://").substringAfter("/", "").let { "/$it" }
     }
-    if (s.basePath.isNotEmpty() && p.startsWith(s.basePath)) p = p.removePrefix(s.basePath)
-    return p.trimStart('/').let { if (it.isEmpty()) "/" else "/$it".let { q -> if (q.endsWith("/")) q else "$q/" } }
+    // href 通常是 URL 编码的(%E7%94%B5%E5%BD%B1), 先解码得到中文路径
+    // (显示与请求都用解码后的相对路径, urlFor() 时会统一再编码)
+    val decoded = decodePathSafe(p)
+    if (s.basePath.isNotEmpty() && decoded.startsWith(s.basePath)) {
+        return decoded.removePrefix(s.basePath).trimStart('/')
+            .let { if (it.isEmpty()) "/" else "/$it".let { q -> if (q.endsWith("/")) q else "$q/" } }
+    }
+    return decoded.trimStart('/').let { if (it.isEmpty()) "/" else "/$it".let { q -> if (q.endsWith("/")) q else "$q/" } }
 }
 
 private fun formatMs(ms: Long): String {
