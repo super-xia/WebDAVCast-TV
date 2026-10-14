@@ -112,6 +112,13 @@ private val TvError = Color(0xFFE5534B)
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 后台预热视频缓存(建 SQLite 索引/扫目录)。低优先级 + 延迟 3 秒启动,
+        // 避免和启动渲染抢 CPU/IO。播放器用 LazyCacheFactory, 缓存没热好也能正常播。
+        Thread {
+            runCatching { android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_BACKGROUND) }
+            Thread.sleep(3_000)
+            runCatching { VideoCache.get(applicationContext) }
+        }.start()
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
@@ -807,12 +814,20 @@ private fun PlayerScreen(
     }
     val currentIdx = remember(episodes, currentName) { episodes?.indexOfFirst { it.name == currentName } ?: -1 }
 
-    val player = remember {
+    // OkHttp 数据源(原逻辑不变: 自动处理中文URL编码/302/Basic认证)
+    val okHttpDsFactory = remember(user, pass) {
         val okHttp = UnsafeOkHttp.client()
-        val dsFactory = OkHttpDataSource.Factory(okHttp)
+        OkHttpDataSource.Factory(okHttp)
             .setUserAgent("WebDAVCast-TV/1.0")
             .setDefaultRequestProperties(mapOf("Authorization" to BasicAuth.header(user, pass)))
-        ExoPlayer.Builder(ctx).setMediaSourceFactory(ProgressiveMediaSource.Factory(dsFactory)).build()
+    }
+    // 预存 + 本地缓存: 起播门槛 2.5 秒不变, 播放中自动预存 120 秒并落盘(上限 1GB / 超 7 天自动清)
+    // LazyCacheFactory: 缓存未就绪时自动降级纯网络, 就绪后自动生效, 全程不阻塞 UI
+    val player = remember(ctx) {
+        VideoCache.playerBuilder(ctx)
+            .setMediaSourceFactory(
+                ProgressiveMediaSource.Factory(VideoCache.LazyCacheFactory(ctx, okHttpDsFactory))
+            ).build()
     }
 
     val latestUrl by rememberUpdatedState(url)
@@ -820,7 +835,7 @@ private fun PlayerScreen(
 
     // 播放页根节点始终持焦点，方向键全部手动处理（避免 Compose 焦点遍历在覆盖层内失效）
     val rootFocus = remember { FocusRequester() }
-    var selectedBtn by remember { mutableStateOf(1) } // 0上集 1播放 2下集 3选集 4倍速 5进度条
+    var selectedBtn by remember { mutableStateOf(1) } // 0上集 1播放 2下集 3选集 4倍速 5预存 6进度条
     var selectedEpisode by remember { mutableStateOf(0) }
     // 倍速
     val speedOptions = floatArrayOf(1f, 1.25f, 1.5f, 2f, 0.75f)
