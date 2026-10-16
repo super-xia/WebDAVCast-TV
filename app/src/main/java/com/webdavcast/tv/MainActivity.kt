@@ -821,7 +821,8 @@ private fun PlayerScreen(
             .setUserAgent("WebDAVCast-TV/1.0")
             .setDefaultRequestProperties(mapOf("Authorization" to BasicAuth.header(user, pass)))
     }
-    // 预存 + 本地缓存: 起播门槛 2.5 秒不变, 播放中自动预存 120 秒并落盘(上限 1GB / 超 7 天自动清)
+    // 预存 + 本地缓存: 起播门槛 2.5 秒不变, 播放中自动预存 120 秒并落盘
+    // (缓存上限按本机容量/剩余空间自动算, 天花板 1GB / 超 7 天自动清)
     // LazyCacheFactory: 缓存未就绪时自动降级纯网络, 就绪后自动生效, 全程不阻塞 UI
     val player = remember(ctx) {
         VideoCache.playerBuilder(ctx)
