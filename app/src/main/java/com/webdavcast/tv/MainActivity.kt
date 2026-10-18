@@ -109,6 +109,11 @@ private val TvText = Color(0xFFF2F2F5)
 private val TvTextDim = Color(0xFF9AA0A8)
 private val TvError = Color(0xFFE5534B)
 
+// 快进/快退参数
+private const val SEEK_TAP_MS = 3_000L        // 单击 ←/→ 跳 3 秒
+private const val SEEK_THROTTLE_MS = 250L     // 连续快按时真正 seekTo 的最小间隔
+private const val SEEK_PENDING_TTL_MS = 800L  // 目标位置闲置多久后与真实位置重新对齐
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -846,6 +851,11 @@ private fun PlayerScreen(
     // 长按方向键连续快进/快退
     var isHolding by remember { mutableStateOf(false) }
     var holdDirection by remember { mutableIntStateOf(0) } // -1=左, +1=右
+    // 目标位置累加: seek 未完成时 player.currentPosition 是滞后的, 连续快按必须自己记账,
+    // 否则后一次 seek 会用旧位置覆盖前一次 → 数字在跳、画面不动
+    var pendingSeekMs by remember { mutableStateOf(-1L) } // -1 = 无待生效目标
+    var lastSentMs by remember { mutableStateOf(-1L) }    // 最后一次真正下发给播放器的目标
+    var lastSeekAt by remember { mutableStateOf(0L) }     // 上次下发时间(节流用)
 
 
     fun showOverlay() { controlsVisible = true; lastControlAction = System.currentTimeMillis() }
@@ -855,11 +865,34 @@ private fun PlayerScreen(
         isPlaying = player.isPlaying
         lastControlAction = System.currentTimeMillis()
     }
+    /**
+     * 快进/快退。以"目标位置"累加, 不再读 player.currentPosition —— seek 未完成时它滞后,
+     * 连续快按会互相覆盖, 表现为"提示数字在跳、画面不动"。
+     * 提示立即更新; 真正 seekTo 节流到 250ms 一次, 松手时由 [flushSeek] 补最后一发。
+     */
     fun seekBy(deltaMs: Long) {
         val d = player.duration
-        val target = (player.currentPosition + deltaMs).coerceIn(0L, if (d > 0) d else Long.MAX_VALUE)
-        if (d > 0) player.seekTo(target)
+        val now = System.currentTimeMillis()
+        // 闲置超过 TTL 说明上一轮 seek 早已生效, 用真实位置重新对齐
+        val base = if (pendingSeekMs >= 0 && now - lastSeekAt <= SEEK_PENDING_TTL_MS) pendingSeekMs
+                   else player.currentPosition
+        val target = (base + deltaMs).coerceIn(0L, if (d > 0) d else Long.MAX_VALUE)
+        pendingSeekMs = target
+        if (d > 0 && target != lastSentMs && now - lastSeekAt >= SEEK_THROTTLE_MS) {
+            player.seekTo(target)
+            lastSentMs = target
+            lastSeekAt = now
+        }
         seekHint = "${if (deltaMs < 0) "⏪ 快退" else "⏩ 快进"} ${formatMs(target)} / ${formatMs(if (d > 0) d else 0L)}"
+    }
+
+    /** 松手/停止连按时, 把节流期间没发出去的最后一段目标补上, 保证不会少跳一截 */
+    fun flushSeek() {
+        if (pendingSeekMs >= 0 && pendingSeekMs != lastSentMs && player.duration > 0) {
+            player.seekTo(pendingSeekMs)
+            lastSentMs = pendingSeekMs
+            lastSeekAt = System.currentTimeMillis()
+        }
     }
 
     // 拉取当前目录视频清单
@@ -913,29 +946,31 @@ private fun PlayerScreen(
     }
 
     // 长按左右键：连续快进/快退，渐进加速
+    // 体感目标: 按 1 秒 ≈ 40~50 秒, 按 3 秒 ≈ 3 分钟, 按 5 秒 ≈ 7 分钟
     LaunchedEffect(isHolding, holdDirection) {
         if (isHolding && holdDirection != 0) {
-            // step 递进: 1s 2s 5s 10s 20s 30s 60s
-            val steps = longArrayOf(1_000, 2_000, 5_000, 10_000, 20_000, 30_000, 60_000)
-            val intervals = intArrayOf(200, 180, 150, 120, 100, 80, 60)
+            // 档位: 5s → 15s → 30s → 60s(步长变大、节奏变慢)
+            val steps = longArrayOf(5_000, 15_000, 30_000, 60_000)
+            val intervals = intArrayOf(100, 200, 350, 400)
             var lvl = 0
             var elapsed = 0
             while (isHolding && holdDirection != 0) {
-                val ms = steps[lvl]
                 delay(intervals[lvl].toLong())
                 elapsed += intervals[lvl]
-                seekBy(holdDirection * ms)
-                // 随时间升级: 1s→2s→5s→10s→20s→30s→60s
+                seekBy(holdDirection * steps[lvl])
+                // 随时间升级: 0.8s 后 15s/步, 2s 后 30s/步, 4s 后 60s/步
                 when {
-                    elapsed > 8000 && lvl < 6 -> lvl = 6
-                    elapsed > 5000 && lvl < 5 -> lvl = 5
-                    elapsed > 3000 && lvl < 4 -> lvl = 4
-                    elapsed > 2000 && lvl < 3 -> lvl = 3
-                    elapsed > 1000 && lvl < 2 -> lvl = 2
-                    elapsed > 500  && lvl < 1 -> lvl = 1
+                    elapsed >= 4000 && lvl < 3 -> lvl = 3
+                    elapsed >= 2000 && lvl < 2 -> lvl = 2
+                    elapsed >= 800  && lvl < 1 -> lvl = 1
                 }
             }
         }
+    }
+
+    // 松手: 把节流期间没发出去的最后一段补上
+    LaunchedEffect(isHolding) {
+        if (!isHolding) flushSeek()
     }
 
     // 选集列表滚动跟随
@@ -1075,11 +1110,11 @@ private fun PlayerScreen(
                     lastControlAction = System.currentTimeMillis()
                     when (ev.key) {
                         Key.DirectionLeft -> {
-                            if (selectedBtn == 5) seekBy(-10_000) else selectedBtn = (selectedBtn - 1).coerceAtLeast(0)
+                            if (selectedBtn == 5) seekBy(-SEEK_TAP_MS) else selectedBtn = (selectedBtn - 1).coerceAtLeast(0)
                             true
                         }
                         Key.DirectionRight -> {
-                            if (selectedBtn == 5) seekBy(10_000) else selectedBtn = (selectedBtn + 1).coerceAtMost(4)
+                            if (selectedBtn == 5) seekBy(SEEK_TAP_MS) else selectedBtn = (selectedBtn + 1).coerceAtMost(4)
                             true
                         }
                         Key.DirectionDown -> { selectedBtn = 5; true } // 下到进度条
@@ -1095,14 +1130,14 @@ private fun PlayerScreen(
                         Key.DirectionLeft -> {
                             if (ev.nativeKeyEvent?.repeatCount == 0) {
                                 isHolding = true; holdDirection = -1
-                                seekBy(-1_000)
+                                seekBy(-SEEK_TAP_MS)
                             }
                             true
                         }
                         Key.DirectionRight -> {
                             if (ev.nativeKeyEvent?.repeatCount == 0) {
                                 isHolding = true; holdDirection = 1
-                                seekBy(1_000)
+                                seekBy(SEEK_TAP_MS)
                             }
                             true
                         }
