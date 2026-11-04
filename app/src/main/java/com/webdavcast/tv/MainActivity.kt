@@ -6,13 +6,10 @@ import android.view.KeyEvent as AndroidKeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
-import androidx.compose.animation.core.RepeatMode
-import androidx.compose.animation.core.animateFloat
-import androidx.compose.animation.core.infiniteRepeatable
-import androidx.compose.animation.core.rememberInfiniteTransition
-import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.MarqueeSpacing
 import androidx.compose.foundation.background
+import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.focusable
@@ -64,8 +61,6 @@ import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.draw.clipToBounds
-import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.runtime.mutableFloatStateOf
@@ -306,16 +301,8 @@ private fun GridFocusCard(
     Column(m, horizontalAlignment = Alignment.CenterHorizontally) { content() }
 }
 
-// ===== 流水灯文字：超长即自动左右循环滚动（不依赖焦点），首尾停顿、速度按溢出距离自适应 =====
-private val MarqueeHoldEasing = androidx.compose.animation.core.Easing { f ->
-    val hold = 0.12f
-    when {
-        f <= hold -> 0f
-        f >= 1f - hold -> 1f
-        else -> (f - hold) / (1f - 2f * hold)
-    }
-}
-
+// ===== 流水灯文字：超长自动左右滚动（官方 basicMarquee，不依赖焦点；内部按无约束宽度测量） =====
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun MarqueeText(
     text: String,
@@ -324,35 +311,23 @@ private fun MarqueeText(
     fontWeight: FontWeight = FontWeight.Normal,
     modifier: Modifier = Modifier,
 ) {
-    var textWidth by remember(text) { mutableIntStateOf(0) }
-    var boxWidth by remember { mutableIntStateOf(0) }
-    val dist = (textWidth - boxWidth).coerceAtLeast(0)
-    Box(modifier.onSizeChanged { boxWidth = it.width }.clipToBounds()) {
-        if (dist > 0) {
-            // 约 55 px/s：长文件名不会一闪而过；3~20 秒封顶
-            val durationMs = remember(dist) { (dist / 55f * 1000f).toInt().coerceIn(3000, 20000) }
-            val transition = rememberInfiniteTransition(label = "marquee")
-            val t by transition.animateFloat(
-                initialValue = 0f, targetValue = 1f,
-                animationSpec = infiniteRepeatable(
-                    tween(durationMillis = durationMs, easing = MarqueeHoldEasing),
-                    RepeatMode.Reverse
-                ), label = "marqueeT"
-            )
-            Text(
-                text, fontSize = fontSize, color = color, fontWeight = fontWeight,
-                maxLines = 1, softWrap = false,
-                onTextLayout = { textWidth = it.size.width },
-                modifier = Modifier.graphicsLayer { translationX = -dist * t }
-            )
-        } else {
-            Text(
-                text, fontSize = fontSize, color = color, fontWeight = fontWeight,
-                maxLines = 1, softWrap = false,
-                onTextLayout = { textWidth = it.size.width }
-            )
-        }
-    }
+    Text(
+        text = text,
+        fontSize = fontSize,
+        color = color,
+        fontWeight = fontWeight,
+        maxLines = 1,
+        softWrap = false,
+        overflow = TextOverflow.Clip,
+        modifier = modifier.basicMarquee(
+            Int.MAX_VALUE,                                              // iterations
+            androidx.compose.foundation.MarqueeAnimationMode.Immediately,
+            800,                                                        // repeatDelayMillis
+            1200,                                                       // initialDelayMillis
+            MarqueeSpacing(24.dp),
+            45.dp,                                                      // velocity
+        )
+    )
 }
 
 // ===== TV 文本输入：聚焦字段 → OK 弹编辑框（避免软键盘挡 D-pad 导航） =====
