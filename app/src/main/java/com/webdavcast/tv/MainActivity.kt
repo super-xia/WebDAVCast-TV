@@ -944,6 +944,7 @@ private fun PlayerScreen(
         if (repeatCount == 0) {                       // 刚按下
             holdDirection = dir
             holdStartedAt = now
+            seekHint = ""                             // 清掉上一次松手留下的"快进至 xx"，避免两段文字重叠
             holdBaseMs = if (pendingSeekMs >= 0 && now - lastSeekAt <= SEEK_PENDING_TTL_MS) pendingSeekMs
                          else runCatching { player.currentPosition }.getOrDefault(0L)
             dragPreviewMs = null
@@ -1201,8 +1202,8 @@ private fun PlayerScreen(
                 modifier = Modifier.align(Alignment.Center).padding(horizontal = 16.dp))
         }
 
-        // seekHint 提示
-        if (seekHint.isNotEmpty()) {
+        // seekHint 提示（拖动预览显示时让位，避免两段文字叠在一起）
+        if (dragPreviewMs == null && seekHint.isNotEmpty()) {
             Text(seekHint, fontSize = 26.sp, fontWeight = FontWeight.Black, color = Color.White,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.align(Alignment.Center).padding(horizontal = 16.dp))
