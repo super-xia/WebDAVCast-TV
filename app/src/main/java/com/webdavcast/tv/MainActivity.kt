@@ -107,9 +107,7 @@ private val TvError = Color(0xFFE5534B)
 private const val SEEK_TAP_MS = 10_000L       // 单击 ←/→ 跳 10 秒
 private const val SEEK_THROTTLE_MS = 250L     // 连续快按时真正 seekTo 的最小间隔
 private const val SEEK_PENDING_TTL_MS = 800L  // 目标位置闲置多久后与真实位置重新对齐
-private const val SEEK_HOLD_DELAY_MS = 320L   // 按住超过这个时间才算长按, 进入拖动预览
-private const val SEEK_PREVIEW_FRAME_MS = 50L // 拖动预览刷新间隔(20fps)
-private const val SEEK_HOLD_MAX_MS = 30_000L  // 拖动预览最长 30 秒, 兜底防按键卡死
+private const val SEEK_HOLD_DELAY_MS = 240L   // 按住超过这个时间才算长按, 进入拖动预览
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -831,7 +829,7 @@ private fun PlayerScreen(
 
     // 播放页根节点始终持焦点，方向键全部手动处理（避免 Compose 焦点遍历在覆盖层内失效）
     val rootFocus = remember { FocusRequester() }
-    var selectedBtn by remember { mutableStateOf(1) } // 0上集 1播放 2下集 3选集 4倍速 5预存 6进度条
+    var selectedBtn by remember { mutableStateOf(1) } // 0上集 1播放 2下集 3选集 4倍速（进度条只显示, 光标不落入）
     var selectedEpisode by remember { mutableStateOf(0) }
     // 倍速
     val speedOptions = floatArrayOf(1f, 1.25f, 1.5f, 2f, 0.75f)
@@ -846,9 +844,10 @@ private fun PlayerScreen(
     var pendingSeekMs by remember { mutableStateOf(-1L) } // -1 = 无待生效目标
     var lastSentMs by remember { mutableStateOf(-1L) }    // 最后一次真正下发给播放器的目标
     var lastSeekAt by remember { mutableStateOf(0L) }     // 上次下发时间(节流用)
-    // 长按拖动预览：只滑数字，松手才 seekTo 一次（避免反复 seek 重新缓冲）
+    // 长按拖动进度：只滑数字，松手才 seekTo 一次（避免反复 seek 重新缓冲）
     var dragPreviewMs by remember { mutableStateOf<Long?>(null) } // null = 未在拖动
-    var dragDirection by remember { mutableIntStateOf(0) }
+    var holdStartedAt by remember { mutableStateOf(0L) }          // 按下时刻（算推进量）
+    var holdBaseMs by remember { mutableStateOf(0L) }              // 按下的起始位置
 
 
     fun showOverlay() { controlsVisible = true; lastControlAction = System.currentTimeMillis() }
@@ -938,54 +937,50 @@ private fun PlayerScreen(
         lastControlAction = System.currentTimeMillis()
     }
 
-    // 长按左右键：拖动预览，只滑数字，松手才 seekTo 一次。
-    // 体感(每秒推进的剧情时长): 30 → 90 → 180 → 360 秒/秒
-    // 防卡死: 循环条件里带硬超时(30 秒)，且所有播放器调用都 runCatching，异常不会把状态留在"拖动中"
-    LaunchedEffect(isHolding, holdDirection) {
-        val dir = holdDirection
-        if (!isHolding || dir == 0) return@LaunchedEffect
-        delay(SEEK_HOLD_DELAY_MS)                        // 没到阈值就松手 = 单击
-        if (!isHolding || holdDirection != dir) return@LaunchedEffect
+    // 长按左右键：拖动进度。整段逻辑完全由按键事件驱动（不起协程、不靠重组），
+    // 所以不存在"协程卡在拖动中、按键和进度条一起僵住"的状态。
+    fun holdKey(repeatCount: Int, dir: Int) {
+        val now = System.currentTimeMillis()
+        if (repeatCount == 0) {                       // 刚按下
+            holdDirection = dir
+            holdStartedAt = now
+            holdBaseMs = if (pendingSeekMs >= 0 && now - lastSeekAt <= SEEK_PENDING_TTL_MS) pendingSeekMs
+                         else runCatching { player.currentPosition }.getOrDefault(0L)
+            dragPreviewMs = null
+            isHolding = true
+            return
+        }
+        if (!isHolding || holdDirection != dir) return
+        val elapsed = now - holdStartedAt
+        if (elapsed < SEEK_HOLD_DELAY_MS) return       // 还没到长按阈值
         val d = runCatching { player.duration }.getOrDefault(0L)
         val maxPos = if (d > 0) d else Long.MAX_VALUE
-        val now = System.currentTimeMillis()
-        val base = if (pendingSeekMs >= 0 && now - lastSeekAt <= SEEK_PENDING_TTL_MS) pendingSeekMs
-                   else runCatching { player.currentPosition }.getOrDefault(0L)
-        var preview = base.coerceIn(0L, maxPos)
-        dragDirection = dir
-        dragPreviewMs = preview
-        seekHint = ""
-        val startedAt = now
-        var lastTick = now
-        while (isHolding && holdDirection == dir &&
-               System.currentTimeMillis() - startedAt < SEEK_HOLD_MAX_MS) {
-            delay(SEEK_PREVIEW_FRAME_MS)
-            val t = System.currentTimeMillis()
-            val dt = (t - lastTick).coerceAtLeast(0L)
-            lastTick = t
-            val elapsed = t - startedAt
-            // 每秒推进的剧情秒数：30 → 90 → 180 → 360（越按越快）
-            val speed = when {
-                elapsed >= 4000 -> 360f
-                elapsed >= 2000 -> 180f
-                elapsed >= 1000 -> 90f
-                else -> 30f
+        dragPreviewMs = (holdBaseMs + dir * seekAdvanceMs(elapsed)).coerceIn(0L, maxPos)
+    }
+
+    // 兜底：个别盒子长按只发一次 KeyDown、不发重复键事件，那就自己按时间推进（最长 30 秒自动停）。
+    // 有重复事件时 dragPreviewMs 会被 holdKey 填上，这个循环立刻退出，不会双写打架。
+    LaunchedEffect(isHolding, holdDirection) {
+        if (!isHolding || holdDirection == 0) return@LaunchedEffect
+        delay(SEEK_HOLD_DELAY_MS + 120)
+        var guard = 0
+        while (isHolding && dragPreviewMs == null && guard < 600) {   // 600 × 50ms = 30 秒上限
+            val elapsed = System.currentTimeMillis() - holdStartedAt
+            val d = runCatching { player.duration }.getOrDefault(0L)
+            val maxPos = if (d > 0) d else Long.MAX_VALUE
+            if (elapsed >= SEEK_HOLD_DELAY_MS) {
+                dragPreviewMs = (holdBaseMs + holdDirection * seekAdvanceMs(elapsed)).coerceIn(0L, maxPos)
             }
-            preview = (preview + dir * (speed * dt / 1000f).toLong()).coerceIn(0L, maxPos)
-            dragPreviewMs = preview
-        }
-        // 超时收尾(比如 KeyUp 事件丢了): 主动复位，别让状态卡在"拖动中"
-        if (System.currentTimeMillis() - startedAt >= SEEK_HOLD_MAX_MS) {
-            isHolding = false; holdDirection = 0
+            delay(60); guard++
         }
     }
 
-    // 松手：拖动预览提交一次 seek；单击则补齐节流期间漏发的最后一发
-    LaunchedEffect(isHolding) {
-        if (isHolding) return@LaunchedEffect
+    /** 松手：拖动过就提交一次 seek，没拖动就算单击跳 10 秒 */
+    fun releaseHold() {
+        val dir = holdDirection
         val preview = dragPreviewMs
+        isHolding = false; holdDirection = 0; dragPreviewMs = null
         if (preview != null) {
-            dragPreviewMs = null
             val d = runCatching { player.duration }.getOrDefault(0L)
             if (d > 0) runCatching {
                 player.seekTo(preview)
@@ -993,9 +988,10 @@ private fun PlayerScreen(
                 lastSeekAt = System.currentTimeMillis()
             }
             pendingSeekMs = -1L
-            seekHint = "${if (dragDirection < 0) "⏪ 快退至" else "⏩ 快进至"} ${formatMs(preview)} / ${formatMs(if (d > 0) d else 0L)}"
+            seekHint = "${if (dir < 0) "⏪ 快退至" else "⏩ 快进至"} ${formatMs(preview)} / ${formatMs(if (d > 0) d else 0L)}"
             lastControlAction = System.currentTimeMillis()
         } else {
+            seekBy(if (dir < 0) -SEEK_TAP_MS else SEEK_TAP_MS)
             flushSeek()
         }
     }
@@ -1101,27 +1097,25 @@ private fun PlayerScreen(
     Box(Modifier.fillMaxSize().background(Color.Black)
         .focusRequester(rootFocus)
         .focusable()
-        .onFocusChanged { if (!it.isFocused && isHolding) { isHolding = false; holdDirection = 0 } }
+        // 播放页所有按键都由根节点统一处理；焦点一被别的节点抢走按键就失灵，这里立刻抢回来
+        .onFocusChanged { st ->
+            if (!st.isFocused) {
+                if (isHolding) { isHolding = false; holdDirection = 0 }
+                runCatching { rootFocus.requestFocus() }
+            }
+        }
         .onKeyEvent { ev ->
-            // 松开方向键：结束长按；没进入拖动(按住 < 阈值)就按单击跳 SEEK_TAP_MS
+            // 松开方向键：拖过就提交跳转，没拖过算单击跳 10 秒
             if (ev.type == KeyEventType.KeyUp) {
                 if (isHolding) {
-                    val wasDrag = dragPreviewMs != null
-                    isHolding = false; holdDirection = 0
-                    if (!wasDrag) {
-                        when (ev.key) {
-                            Key.DirectionLeft -> seekBy(-SEEK_TAP_MS)
-                            Key.DirectionRight -> seekBy(SEEK_TAP_MS)
-                            else -> {}
-                        }
-                    }
+                    releaseHold()
                     return@onKeyEvent true
                 }
             }
             if (ev.type != KeyEventType.KeyDown) return@onKeyEvent false
-            // 拖动中途按了别的键：先复位，别让拖动状态残留（松手逻辑会提交当前预览位置）
+            // 拖动中途按了别的键：先按当前预览位置收尾，别让拖动状态残留
             if (isHolding && ev.key != Key.DirectionLeft && ev.key != Key.DirectionRight) {
-                isHolding = false; holdDirection = 0
+                releaseHold()
             }
             val menuKey = ev.nativeKeyEvent?.keyCode == AndroidKeyEvent.KEYCODE_MENU
             // 菜单键：召唤/隐藏控制栏
@@ -1150,15 +1144,15 @@ private fun PlayerScreen(
                     lastControlAction = System.currentTimeMillis()
                     when (ev.key) {
                         Key.DirectionLeft -> {
-                            if (selectedBtn == 5) seekBy(-SEEK_TAP_MS) else selectedBtn = (selectedBtn - 1).coerceAtLeast(0)
+                            selectedBtn = (selectedBtn - 1).coerceAtLeast(0)
                             true
                         }
                         Key.DirectionRight -> {
-                            if (selectedBtn == 5) seekBy(SEEK_TAP_MS) else selectedBtn = (selectedBtn + 1).coerceAtMost(4)
+                            selectedBtn = (selectedBtn + 1).coerceAtMost(4)
                             true
                         }
-                        Key.DirectionDown -> { selectedBtn = 5; true } // 下到进度条
-                        Key.DirectionUp -> { if (selectedBtn == 5) selectedBtn = 1; true } // 从进度条回按钮
+                        Key.DirectionDown -> { selectedBtn = selectedBtn.coerceIn(0, 4); true } // 进度条只做显示, 光标不落到进度条
+                        Key.DirectionUp -> { selectedBtn = selectedBtn.coerceIn(0, 4); true }
                         Key.DirectionCenter, Key.Enter -> { activate(selectedBtn); true }
                         Key.Back -> { hideOverlay(); true }
                         else -> false
@@ -1167,18 +1161,9 @@ private fun PlayerScreen(
                 // 控制栏隐藏：左/右=长按连续快进/快退，OK=播放/暂停，上下=唤出控制栏
                 else -> {
                     when (ev.key) {
-                        Key.DirectionLeft -> {
-                            if (ev.nativeKeyEvent?.repeatCount == 0) {
-                                isHolding = true; holdDirection = -1
-                            }
-                            true
-                        }
-                        Key.DirectionRight -> {
-                            if (ev.nativeKeyEvent?.repeatCount == 0) {
-                                isHolding = true; holdDirection = 1
-                            }
-                            true
-                        }
+                        // ←/→：按下即进入长按拖动，重复事件继续推进；不用唤出控制栏
+                        Key.DirectionLeft -> { holdKey(ev.nativeKeyEvent?.repeatCount ?: 0, -1); true }
+                        Key.DirectionRight -> { holdKey(ev.nativeKeyEvent?.repeatCount ?: 0, 1); true }
                         Key.DirectionCenter, Key.Enter -> { showOverlay(); togglePlayPause(); true }
                         Key.DirectionUp, Key.DirectionDown -> { showOverlay(); true }
                         Key.Back -> { onSystemBack(); true }
@@ -1210,7 +1195,7 @@ private fun PlayerScreen(
         // 拖动预览提示：沿用 1.0.8 的大字提示样式（不铺全屏浮层）
         dragPreviewMs?.let { pv ->
             Text(
-                "${if (dragDirection < 0) "⏪ 快退" else "⏩ 快进"} ${formatMs(pv)} / ${formatMs(if (durationMs > 0) durationMs else 0L)}",
+                "${if (holdDirection < 0) "⏪ 快退" else "⏩ 快进"} ${formatMs(pv)} / ${formatMs(if (durationMs > 0) durationMs else 0L)}",
                 fontSize = 26.sp, fontWeight = FontWeight.Black, color = Color.White,
                 textAlign = TextAlign.Center,
                 modifier = Modifier.align(Alignment.Center).padding(horizontal = 16.dp))
@@ -1255,18 +1240,18 @@ private fun PlayerScreen(
                 .background(Color.Black.copy(alpha = 0.6f)).padding(vertical = 16.dp)) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 60.dp),
                     horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
-                    TvControlButton("⏮", "上集", selected = selectedBtn == 0) { activate(0) }
+                    TvControlButton("⏮", "上集", selected = selectedBtn == 0)
                     TvControlButton(
                         if (isPlaying) "⏸" else "▶", if (isPlaying) "暂停" else "播放",
                         selected = selectedBtn == 1
-                    ) { activate(1) }
-                    TvControlButton("⏭", "下集", selected = selectedBtn == 2) { activate(2) }
-                    TvControlButton("☰", "选集", selected = selectedBtn == 3) { activate(3) }
-                    TvControlButton("×${playbackSpeed}", "倍速", selected = selectedBtn == 4) { activate(4) }
+                    )
+                    TvControlButton("⏭", "下集", selected = selectedBtn == 2)
+                    TvControlButton("☰", "选集", selected = selectedBtn == 3)
+                    TvControlButton("×${playbackSpeed}", "倍速", selected = selectedBtn == 4)
                 }
                 Spacer(Modifier.height(14.dp))
                 // 进度条（选中后 ←/→ 拖动 seek）
-                TvSeekBar(positionMs = positionMs, durationMs = durationMs, selected = selectedBtn == 5)
+                TvSeekBar(positionMs = positionMs, durationMs = durationMs, selected = false)
             }
         }
 
@@ -1291,7 +1276,6 @@ private fun PlayerScreen(
                                 Row(Modifier.fillMaxWidth()
                                     .background(if (isSel) TvFocusBg else Color.Transparent, RoundedCornerShape(8.dp))
                                     .border(2.dp, if (isSel) TvAccentBright else Color.Transparent, RoundedCornerShape(8.dp))
-                                    .clickable { switchToEpisode(e) }
                                     .padding(horizontal = 12.dp, vertical = 8.dp),
                                     verticalAlignment = Alignment.CenterVertically) {
                                     Text("${i + 1}.", fontSize = 18.sp,
@@ -1315,7 +1299,6 @@ private fun PlayerScreen(
                 Spacer(Modifier.height(12.dp))
                 Row(Modifier.fillMaxWidth()
                     .background(TvCardBg, RoundedCornerShape(10.dp))
-                    .clickable { showEpisodes = false; lastControlAction = System.currentTimeMillis() }
                     .padding(vertical = 10.dp),
                     horizontalArrangement = Arrangement.Center) {
                     Text("关闭", fontSize = 18.sp, color = TvTextDim)
@@ -1330,10 +1313,11 @@ private fun PlayerScreen(
 
 // ===== 覆盖层按钮 =====
 @Composable
-private fun TvControlButton(symbol: String, label: String, selected: Boolean = false, onClick: () -> Unit) {
+// 控制栏按钮：纯显示件（光标由 selectedBtn 驱动），不加 clickable —— clickable 会变成可聚焦节点，
+// 焦点一被它抢走，控制栏自动隐藏后根节点就收不到按键，表现为"长按左右没反应"
+private fun TvControlButton(symbol: String, label: String, selected: Boolean = false) {
     Column(
         Modifier
-            .clickable(onClick = onClick)
             .graphicsLayer { val s = if (selected) 1.12f else 1f; scaleX = s; scaleY = s }
             .background(if (selected) TvFocusBg else Color.Transparent, RoundedCornerShape(10.dp))
             .border(2.dp, if (selected) TvAccentBright else Color.Transparent, RoundedCornerShape(10.dp))
@@ -1416,6 +1400,19 @@ private fun relativePath(s: ServerEntry, href: String): String {
             .let { if (it.isEmpty()) "/" else "/$it".let { q -> if (q.endsWith("/")) q else "$q/" } }
     }
     return decoded.trimStart('/').let { if (it.isEmpty()) "/" else "/$it".let { q -> if (q.endsWith("/")) q else "$q/" } }
+}
+
+/** 长按拖动时, 按住 t 毫秒总共推进多少剧情毫秒。
+ *  速度分段: 0~1s = 30 倍, 1~2s = 90 倍, 2~4s = 180 倍, 4s 之后 = 360 倍(每秒推进的剧情秒数)。 */
+private fun seekAdvanceMs(tMs: Long): Long {
+    val t = tMs / 1000.0
+    val sec = when {
+        t <= 1.0 -> 30.0 * t
+        t <= 2.0 -> 30.0 + 90.0 * (t - 1.0)
+        t <= 4.0 -> 120.0 + 180.0 * (t - 2.0)
+        else -> 480.0 + 360.0 * (t - 4.0)
+    }
+    return (sec * 1000.0).toLong()
 }
 
 private fun formatMs(ms: Long): String {
