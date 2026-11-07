@@ -104,9 +104,12 @@ private val TvTextDim = Color(0xFF9AA0A8)
 private val TvError = Color(0xFFE5534B)
 
 // 快进/快退参数
-private const val SEEK_TAP_MS = 3_000L        // 单击 ←/→ 跳 3 秒
+private const val SEEK_TAP_MS = 10_000L       // 单击 ←/→ 跳 10 秒
 private const val SEEK_THROTTLE_MS = 250L     // 连续快按时真正 seekTo 的最小间隔
 private const val SEEK_PENDING_TTL_MS = 800L  // 目标位置闲置多久后与真实位置重新对齐
+private const val SEEK_HOLD_DELAY_MS = 320L   // 按住超过这个时间才算长按, 进入拖动预览
+private const val SEEK_PREVIEW_FRAME_MS = 50L // 拖动预览刷新间隔(20fps)
+private const val SEEK_HOLD_MAX_MS = 30_000L  // 拖动预览最长 30 秒, 兜底防按键卡死
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -270,7 +273,7 @@ private fun FocusCard(
     Row(m, verticalAlignment = Alignment.CenterVertically, content = content)
 }
 
-// ===== 竖向网格焦点卡片：图标在上、名称在下，超长文件名自动流水灯 =====
+// ===== 竖向网格焦点卡片：图标在上、名称在下，焦点时文件名流水灯滚动 =====
 @Composable
 private fun GridFocusCard(
     modifier: Modifier = Modifier,
@@ -843,6 +846,9 @@ private fun PlayerScreen(
     var pendingSeekMs by remember { mutableStateOf(-1L) } // -1 = 无待生效目标
     var lastSentMs by remember { mutableStateOf(-1L) }    // 最后一次真正下发给播放器的目标
     var lastSeekAt by remember { mutableStateOf(0L) }     // 上次下发时间(节流用)
+    // 长按拖动预览：只滑数字，松手才 seekTo 一次（避免反复 seek 重新缓冲）
+    var dragPreviewMs by remember { mutableStateOf<Long?>(null) } // null = 未在拖动
+    var dragDirection by remember { mutableIntStateOf(0) }
 
 
     fun showOverlay() { controlsVisible = true; lastControlAction = System.currentTimeMillis() }
@@ -932,32 +938,66 @@ private fun PlayerScreen(
         lastControlAction = System.currentTimeMillis()
     }
 
-    // 长按左右键：连续快进/快退，渐进加速
-    // 体感目标: 按 1 秒 ≈ 40~50 秒, 按 3 秒 ≈ 3 分钟, 按 5 秒 ≈ 7 分钟
+    // 长按左右键：拖动预览，只滑数字，松手才 seekTo 一次。
+    // 体感(每秒推进的剧情时长): 30 → 90 → 180 → 360 秒/秒
+    // 防卡死: 循环条件里带硬超时(30 秒)，且所有播放器调用都 runCatching，异常不会把状态留在"拖动中"
     LaunchedEffect(isHolding, holdDirection) {
-        if (isHolding && holdDirection != 0) {
-            // 档位: 5s → 15s → 30s → 60s(步长变大、节奏变慢)
-            val steps = longArrayOf(5_000, 15_000, 30_000, 60_000)
-            val intervals = intArrayOf(100, 200, 350, 400)
-            var lvl = 0
-            var elapsed = 0
-            while (isHolding && holdDirection != 0) {
-                delay(intervals[lvl].toLong())
-                elapsed += intervals[lvl]
-                seekBy(holdDirection * steps[lvl])
-                // 随时间升级: 0.8s 后 15s/步, 2s 后 30s/步, 4s 后 60s/步
-                when {
-                    elapsed >= 4000 && lvl < 3 -> lvl = 3
-                    elapsed >= 2000 && lvl < 2 -> lvl = 2
-                    elapsed >= 800  && lvl < 1 -> lvl = 1
-                }
+        val dir = holdDirection
+        if (!isHolding || dir == 0) return@LaunchedEffect
+        delay(SEEK_HOLD_DELAY_MS)                        // 没到阈值就松手 = 单击
+        if (!isHolding || holdDirection != dir) return@LaunchedEffect
+        val d = runCatching { player.duration }.getOrDefault(0L)
+        val maxPos = if (d > 0) d else Long.MAX_VALUE
+        val now = System.currentTimeMillis()
+        val base = if (pendingSeekMs >= 0 && now - lastSeekAt <= SEEK_PENDING_TTL_MS) pendingSeekMs
+                   else runCatching { player.currentPosition }.getOrDefault(0L)
+        var preview = base.coerceIn(0L, maxPos)
+        dragDirection = dir
+        dragPreviewMs = preview
+        seekHint = ""
+        val startedAt = now
+        var lastTick = now
+        while (isHolding && holdDirection == dir &&
+               System.currentTimeMillis() - startedAt < SEEK_HOLD_MAX_MS) {
+            delay(SEEK_PREVIEW_FRAME_MS)
+            val t = System.currentTimeMillis()
+            val dt = (t - lastTick).coerceAtLeast(0L)
+            lastTick = t
+            val elapsed = t - startedAt
+            // 每秒推进的剧情秒数：30 → 90 → 180 → 360（越按越快）
+            val speed = when {
+                elapsed >= 4000 -> 360f
+                elapsed >= 2000 -> 180f
+                elapsed >= 1000 -> 90f
+                else -> 30f
             }
+            preview = (preview + dir * (speed * dt / 1000f).toLong()).coerceIn(0L, maxPos)
+            dragPreviewMs = preview
+        }
+        // 超时收尾(比如 KeyUp 事件丢了): 主动复位，别让状态卡在"拖动中"
+        if (System.currentTimeMillis() - startedAt >= SEEK_HOLD_MAX_MS) {
+            isHolding = false; holdDirection = 0
         }
     }
 
-    // 松手: 把节流期间没发出去的最后一段补上
+    // 松手：拖动预览提交一次 seek；单击则补齐节流期间漏发的最后一发
     LaunchedEffect(isHolding) {
-        if (!isHolding) flushSeek()
+        if (isHolding) return@LaunchedEffect
+        val preview = dragPreviewMs
+        if (preview != null) {
+            dragPreviewMs = null
+            val d = runCatching { player.duration }.getOrDefault(0L)
+            if (d > 0) runCatching {
+                player.seekTo(preview)
+                lastSentMs = preview
+                lastSeekAt = System.currentTimeMillis()
+            }
+            pendingSeekMs = -1L
+            seekHint = "${if (dragDirection < 0) "⏪ 快退至" else "⏩ 快进至"} ${formatMs(preview)} / ${formatMs(if (d > 0) d else 0L)}"
+            lastControlAction = System.currentTimeMillis()
+        } else {
+            flushSeek()
+        }
     }
 
     // 选集列表滚动跟随
@@ -1061,15 +1101,28 @@ private fun PlayerScreen(
     Box(Modifier.fillMaxSize().background(Color.Black)
         .focusRequester(rootFocus)
         .focusable()
+        .onFocusChanged { if (!it.isFocused && isHolding) { isHolding = false; holdDirection = 0 } }
         .onKeyEvent { ev ->
-            // 松开方向键：停止长按连续 seek
+            // 松开方向键：结束长按；没进入拖动(按住 < 阈值)就按单击跳 SEEK_TAP_MS
             if (ev.type == KeyEventType.KeyUp) {
                 if (isHolding) {
+                    val wasDrag = dragPreviewMs != null
                     isHolding = false; holdDirection = 0
+                    if (!wasDrag) {
+                        when (ev.key) {
+                            Key.DirectionLeft -> seekBy(-SEEK_TAP_MS)
+                            Key.DirectionRight -> seekBy(SEEK_TAP_MS)
+                            else -> {}
+                        }
+                    }
                     return@onKeyEvent true
                 }
             }
             if (ev.type != KeyEventType.KeyDown) return@onKeyEvent false
+            // 拖动中途按了别的键：先复位，别让拖动状态残留（松手逻辑会提交当前预览位置）
+            if (isHolding && ev.key != Key.DirectionLeft && ev.key != Key.DirectionRight) {
+                isHolding = false; holdDirection = 0
+            }
             val menuKey = ev.nativeKeyEvent?.keyCode == AndroidKeyEvent.KEYCODE_MENU
             // 菜单键：召唤/隐藏控制栏
             if (menuKey && !showEpisodes) {
@@ -1117,14 +1170,12 @@ private fun PlayerScreen(
                         Key.DirectionLeft -> {
                             if (ev.nativeKeyEvent?.repeatCount == 0) {
                                 isHolding = true; holdDirection = -1
-                                seekBy(-SEEK_TAP_MS)
                             }
                             true
                         }
                         Key.DirectionRight -> {
                             if (ev.nativeKeyEvent?.repeatCount == 0) {
                                 isHolding = true; holdDirection = 1
-                                seekBy(SEEK_TAP_MS)
                             }
                             true
                         }
@@ -1154,6 +1205,15 @@ private fun PlayerScreen(
                 update = { v -> v.player = player },
                 modifier = Modifier.matchParentSize()
             )
+        }
+
+        // 拖动预览提示：沿用 1.0.8 的大字提示样式（不铺全屏浮层）
+        dragPreviewMs?.let { pv ->
+            Text(
+                "${if (dragDirection < 0) "⏪ 快退" else "⏩ 快进"} ${formatMs(pv)} / ${formatMs(if (durationMs > 0) durationMs else 0L)}",
+                fontSize = 26.sp, fontWeight = FontWeight.Black, color = Color.White,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.align(Alignment.Center).padding(horizontal = 16.dp))
         }
 
         // seekHint 提示
