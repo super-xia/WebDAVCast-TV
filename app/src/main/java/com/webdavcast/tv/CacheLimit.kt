@@ -31,6 +31,23 @@ object CacheLimit {
     /** 最小档(MB): 总容量小于 4G 的机器 */
     private const val FLOOR_MB = 512L
 
+    /** 总容量 ≤ 该值(MB) → 直接关掉缓存(0)。8GB 及以下的小存储盒子/电视,
+     *  缓存一多就把它撑满, 宁可纯网络播放也不落盘。 */
+    const val DISABLE_AT_TOTAL_MB = 8 * 1024L
+
+    /** 本机总容量(MB)。取不到返回 0。 */
+    fun totalMb(ctx: Context): Long = try {
+        StatFs(ctx.cacheDir.absolutePath).totalBytes / MB
+    } catch (e: Exception) {
+        0L
+    }
+
+    /** 是否关闭缓存: 总容量 ≤8GB 时为 true。取不到容量信息时返回 false(按可用处理)。 */
+    fun disabled(ctx: Context): Boolean {
+        val total = totalMb(ctx)
+        return total in 1..DISABLE_AT_TOTAL_MB
+    }
+
     /** 总容量(MB) 达到阈值 → 缓存上限(MB), 从大到小匹配。
      *  注意: 当前天花板 1GB, 所以 ≥4G 的机器都被夹到 1GB; 提高 MAX_MB 后这张表才逐级生效。 */
     private val TIERS = listOf(
@@ -50,8 +67,9 @@ object CacheLimit {
         0L
     }
 
-    /** 本机当前应给的缓存上限(MB)。取不到磁盘信息时退回 1GB。 */
+    /** 本机当前应给的缓存上限(MB)。总容量 ≤8GB → 0(关闭缓存)。取不到磁盘信息时退回 1GB。 */
     fun limitMb(ctx: Context): Long {
+        if (disabled(ctx)) return 0L
         val st = try {
             StatFs(ctx.cacheDir.absolutePath)
         } catch (e: Exception) {
@@ -72,8 +90,10 @@ object CacheLimit {
     fun describe(mb: Long): String =
         if (mb >= 1024) "%.1fGB".format(mb / 1024.0) else "${mb}MB"
 
-    /** 一行说明, 用于日志/界面: "上限 4.0GB (总24.0GB/剩17.6GB)" */
+    /** 一行说明, 用于日志/界面: "上限 4.0GB (总24.0GB/剩17.6GB)" / "已关闭(总7.3GB≤8GB)" */
     fun debugLine(ctx: Context): String {
+        val t0 = totalMb(ctx)
+        if (t0 in 1..DISABLE_AT_TOTAL_MB) return "已关闭(总${describe(t0)}≤8GB, 不落盘)"
         val mb = limitMb(ctx)
         val st = try {
             StatFs(ctx.cacheDir.absolutePath)

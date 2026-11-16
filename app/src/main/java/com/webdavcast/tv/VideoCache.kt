@@ -39,15 +39,28 @@ object VideoCache {
     @Volatile
     private var monitor: Thread? = null
 
+    /** 只打一次"已关闭缓存"日志, 避免每次建数据源都刷屏 */
+    @Volatile
+    private var loggedOff = false
+
     /** 本机当前的缓存上限(MB), 按总容量分档 + 剩余空间收紧 */
     fun limitMb(ctx: Context): Long = CacheLimit.limitMb(ctx)
 
     /** 本机当前的缓存上限(字节) */
     fun limitBytes(ctx: Context): Long = CacheLimit.limitBytes(ctx)
 
-    /** 取缓存实例(懒加载)。初始化失败返回 null, 调用方自动降级为纯网络播放。 */
+    /** 取缓存实例(懒加载)。初始化失败或本机存储 ≤8GB(关闭缓存)返回 null,
+     *  调用方自动降级为纯网络播放。 */
     fun get(ctx: Context): SimpleCache? {
         cache?.let { return it }
+        // 小存储(总容量 ≤8GB)不落盘: 缓存一多就把盒子撑满, 直接纯网络播放。
+        if (CacheLimit.disabled(ctx)) {
+            if (!loggedOff) {
+                loggedOff = true
+                android.util.Log.i("VideoCache", "本机存储${CacheLimit.debugLine(ctx)}, 不启用缓存")
+            }
+            return null
+        }
         return synchronized(this) {
             cache ?: try {
                 val limit = CacheLimit.limitBytes(ctx)
