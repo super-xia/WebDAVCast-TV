@@ -112,6 +112,11 @@ private const val SEEK_HOLD_DELAY_MS = 240L   // 按住超过这个时间才算�
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 全App保持亮屏: 小米盒子等 TV 系统按"整机无操作"计时进屏保, 播放页/列表页都
+        // 不收按键, 到点就被盖屏保。给窗口挂 FLAG_KEEP_SCREEN_ON —— 只要本窗口在
+        // 前台可见, 系统就不判定空闲、不会进屏保; 窗口不可见(退桌面/切别的App)时
+        // 该标记自然失效, 仍按系统设置正常屏保。
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         // 后台预热视频缓存(建 SQLite 索引/扫目录)。低优先级 + 延迟 3 秒启动,
         // 避免和启动渲染抢 CPU/IO。播放器用 LazyCacheFactory, 缓存没热好也能正常播。
         Thread {
@@ -1058,8 +1063,13 @@ private fun PlayerScreen(
                 }
                 playError = "播放失败 [${error.errorCodeName}]: $detail"
             }
+            override fun onIsPlayingChanged(playing: Boolean) {
+                // 状态栏图标立即跟随, 不等 300ms 轮询
+                isPlaying = playing
+            }
             override fun onPlaybackStateChanged(state: Int) {
                 if (state == Player.STATE_ENDED) {
+                    isPlaying = false
                     seekHint = "🎬 播放完毕"
                     Prefs.saveHistory(ctx, latestUrl, latestName.ifEmpty { latestUrl.substringAfterLast('/') }, 0L, 0L, currentPath)
                 }

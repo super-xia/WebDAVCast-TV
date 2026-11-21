@@ -13,8 +13,8 @@ android {
         applicationId = "com.webdavcast.tv"
         minSdk = 23
         targetSdk = 34
-        versionCode = 15
-        versionName = "1.0.11"
+        versionCode = 16
+        versionName = "1.0.12"
     }
 
     val keystoreProperties = Properties().also {
